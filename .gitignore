@@ -1,0 +1,13 @@
+node_modules/
+.wrangler/
+.dev.vars
+.tmp-secrets.json
+.env
+.env.*
+!.env.example
+!.dev.vars.example
+.venv/
+_legacy_python/
+__pycache__/
+*.pyc
+dist/

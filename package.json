@@ -1,0 +1,19 @@
+{
+  "name": "vector-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VectorBot — Personal Modular Telegram AI Assistant on Cloudflare Workers (Glance CMS + Gemini)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cf-typegen": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "setup": "node scripts/setup.mjs",
+    "check-env": "node scripts/setup.mjs --check-only"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261119.1",
+    "typescript": "^5.7.3",
+    "wrangler": "^4.166.0"
+  }
+}

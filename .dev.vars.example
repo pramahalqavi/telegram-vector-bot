@@ -1,0 +1,8 @@
+# Secrets for local development (`npx wrangler dev`)
+# Copy this file to `.dev.vars` (which is git-ignored) and fill in your values.
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_WEBHOOK_SECRET=
+ALLOWED_TELEGRAM_USER_ID=
+GEMINI_API_KEY=
+FIREBASE_CLIENT_EMAIL=
+FIREBASE_PRIVATE_KEY=
