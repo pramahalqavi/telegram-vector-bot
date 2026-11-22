@@ -132,3 +132,36 @@ export async function answerCallbackQuery(
     ...(text ? { text } : {}),
   });
 }
+
+/**
+ * Downloads an uploaded Telegram file into ephemeral Worker RAM (Uint8Array).
+ * Telegram Bot API supports downloading files up to 20 MB.
+ */
+export async function downloadTelegramFile(
+  env: RuntimeEnv,
+  fileId: string,
+): Promise<{ bytes: Uint8Array; filePath: string }> {
+  const fileInfo = await callTelegramApi<{ file_id: string; file_path?: string }>(
+    env,
+    "getFile",
+    { file_id: fileId },
+  );
+
+  if (!fileInfo?.file_path) {
+    throw new Error(
+      "Could not retrieve file path from Telegram (note: Telegram limits bot downloads to 20 MB).",
+    );
+  }
+
+  const downloadUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
+  const response = await fetch(downloadUrl);
+  if (!response.ok) {
+    throw new Error(`Failed to download file from Telegram (${response.status}).`);
+  }
+
+  const buffer = await response.arrayBuffer();
+  return {
+    bytes: new Uint8Array(buffer),
+    filePath: fileInfo.file_path,
+  };
+}

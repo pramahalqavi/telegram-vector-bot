@@ -2,10 +2,12 @@ import { deleteBook, getBookSummary, getCatalog, upsertBook } from "../firebase"
 import {
   classifyIntent,
   generateBookSummaryDraft,
+  generateBookSummaryFromDocument,
   reviseBookSummaryDraft,
 } from "../gemini";
 import {
   answerCallbackQuery,
+  downloadTelegramFile,
   editMessageText,
   escapeHtml,
   markdownToTelegramHtml,
@@ -19,6 +21,7 @@ import type {
   PendingDraft,
   RuntimeEnv,
   TelegramCallbackQuery,
+  TelegramDocument,
   TelegramMessage,
 } from "../types";
 
@@ -450,11 +453,86 @@ function getHelpHtml(): string {
     `• <code>/draft</code> — View your currently staged draft`,
     `• <code>/cancel</code> — Discard your currently staged draft`,
     ``,
+    `<b>📄 Summarize From Ebook / Document File:</b>`,
+    `• Upload any <b>.pdf</b>, <b>.epub</b>, <b>.txt</b>, <b>.md</b>, or <b>.html</b> file (up to 20 MB) directly to this chat (with an optional caption for focus instructions).`,
+    `• Processed in ephemeral memory — 0 bytes are kept on Cloudflare or Gemini after drafting!`,
+    ``,
     `<b>Natural Language & Review Flow:</b>`,
     `• Ask naturally: <i>"Create a summary for The Lean Startup by Eric Ries"</i>`,
     `• Update existing: <i>"Update atomic-habits: add a 6th chapter on environment design"</i>`,
     `• Revise active draft: While a draft is pending, just reply with changes (e.g. <i>"Make chapter 3 more practical with examples"</i>) before tapping <b>✅ Confirm & Push</b>.`,
   ].join("\n");
+}
+
+const MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024; // 20 MB Telegram Bot API limit
+
+async function handleDocumentUpload(
+  env: RuntimeEnv,
+  chatId: number,
+  userId: string,
+  doc: TelegramDocument,
+  caption?: string,
+): Promise<void> {
+  const fileName = doc.file_name || "uploaded_document";
+  const mimeType = doc.mime_type || "application/octet-stream";
+  const lowerName = fileName.toLowerCase();
+
+  const isSupported =
+    /\.(pdf|epub|txt|md|markdown|html|htm|xhtml)$/i.test(lowerName) ||
+    mimeType === "application/pdf" ||
+    mimeType === "application/epub+zip" ||
+    mimeType.startsWith("text/");
+
+  if (!isSupported) {
+    await sendMessage(
+      env,
+      chatId,
+      `⚠️ <b>Unsupported file format:</b> <code>${escapeHtml(fileName)}</code>\n\nSupported formats: <b>.pdf</b>, <b>.epub</b>, <b>.txt</b>, <b>.md</b>, <b>.html</b>`,
+    );
+    return;
+  }
+
+  if (doc.file_size && doc.file_size > MAX_TELEGRAM_FILE_BYTES) {
+    const sizeMb = (doc.file_size / (1024 * 1024)).toFixed(1);
+    await sendMessage(
+      env,
+      chatId,
+      `⚠️ <b>File too large (${sizeMb} MB):</b> Telegram's Bot API limits file downloads to <b>20 MB</b>. Try uploading an <b>.epub</b> or compressed PDF under 20 MB.`,
+    );
+    return;
+  }
+
+  await sendMessage(
+    env,
+    chatId,
+    [
+      `⏳ <b>Reading & summarizing uploaded file:</b> <code>${escapeHtml(fileName)}</code>`,
+      caption ? `📝 <i>Focus: "${escapeHtml(caption)}"</i>` : "",
+      `<i>Processed in ephemeral RAM — file is discarded immediately after the draft is created (~15–25s)...</i>`,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+  );
+
+  const { bytes } = await downloadTelegramFile(env, doc.file_id);
+  const generated = await generateBookSummaryFromDocument(env, {
+    fileName,
+    mimeType,
+    bytes,
+    userCaption: caption,
+  });
+
+  const draft: PendingDraft = {
+    action: "create",
+    bookId: generated.summary.id,
+    summary: generated.summary,
+    catalogItem: generated.catalogItem,
+    changeSummary: generated.changeSummary,
+    createdAt: new Date().toISOString(),
+  };
+
+  await saveActiveDraft(env, userId, draft);
+  await sendMessage(env, chatId, formatDraftPreviewHtml(draft), buildDraftKeyboard(draft));
 }
 
 // --- Public Entrypoints for Messages and Callbacks ---
@@ -465,6 +543,29 @@ export async function handleTelegramMessage(
   userId: string,
 ): Promise<void> {
   const chatId = message.chat.id;
+
+  // Handle uploaded Ebook / Document files (.pdf, .epub, .txt, .md, .html)
+  if (message.document) {
+    try {
+      await handleDocumentUpload(
+        env,
+        chatId,
+        userId,
+        message.document,
+        message.caption?.trim(),
+      );
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      console.error(JSON.stringify({ message: "handleDocumentUpload_error", error: errMsg }));
+      await sendMessage(
+        env,
+        chatId,
+        `⚠️ <b>File Summarization Failed:</b> <code>${escapeHtml(errMsg.slice(0, 400))}</code>`,
+      );
+    }
+    return;
+  }
+
   const text = (message.text ?? "").trim();
   if (!text) return;
 

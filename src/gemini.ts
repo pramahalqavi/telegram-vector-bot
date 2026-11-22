@@ -1,3 +1,4 @@
+import { extractTextFromEpub, extractTextFromPlainOrHtml } from "./ebook";
 import type { BookCatalogItem, BookSummary, PendingDraft, RuntimeEnv } from "./types";
 
 export type IntentType =
@@ -33,10 +34,10 @@ interface GeminiGenerateContentResponse {
   error?: { message?: string };
 }
 
-async function callGemini(
+async function callGeminiParts(
   env: RuntimeEnv,
   systemInstruction: string,
-  userPrompt: string,
+  userParts: Array<Record<string, unknown>>,
   responseSchema?: Record<string, unknown>,
 ): Promise<string> {
   const primaryModel = env.GEMINI_MODEL || "gemini-3.8-flash";
@@ -69,7 +70,7 @@ async function callGemini(
         contents: [
           {
             role: "user",
-            parts: [{ text: userPrompt }],
+            parts: userParts,
           },
         ],
         generationConfig,
@@ -90,6 +91,95 @@ async function callGemini(
   }
 
   throw new Error(lastError || "Gemini API returned an empty response.");
+}
+
+async function callGemini(
+  env: RuntimeEnv,
+  systemInstruction: string,
+  userPrompt: string,
+  responseSchema?: Record<string, unknown>,
+): Promise<string> {
+  return callGeminiParts(env, systemInstruction, [{ text: userPrompt }], responseSchema);
+}
+
+// --- Ephemeral Gemini File API Helpers for PDFs (Upload -> Summarize -> Immediate Delete) ---
+
+interface GeminiUploadedFile {
+  name: string;
+  uri: string;
+  state?: string;
+}
+
+async function uploadGeminiTempFile(
+  env: RuntimeEnv,
+  bytes: Uint8Array,
+  mimeType: string,
+  displayName: string,
+): Promise<GeminiUploadedFile> {
+  const startRes = await fetch(
+    "https://generativelanguage.googleapis.com/upload/v1beta/files",
+    {
+      method: "POST",
+      headers: {
+        "x-goog-api-key": env.GEMINI_API_KEY,
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": String(bytes.byteLength),
+        "X-Goog-Upload-Header-Content-Type": mimeType,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        file: { display_name: displayName },
+      }),
+    },
+  );
+
+  if (!startRes.ok) {
+    const errText = await startRes.text();
+    throw new Error(`Failed to initiate Gemini file upload (${startRes.status}): ${errText}`);
+  }
+
+  const uploadUrl = startRes.headers.get("x-goog-upload-url");
+  if (!uploadUrl) {
+    throw new Error("Gemini File API did not return an upload URL.");
+  }
+
+  const uploadRes = await fetch(uploadUrl, {
+    method: "POST",
+    headers: {
+      "Content-Length": String(bytes.byteLength),
+      "X-Goog-Upload-Offset": "0",
+      "X-Goog-Upload-Command": "upload, finalize",
+    },
+    body: bytes,
+  });
+
+  if (!uploadRes.ok) {
+    const errText = await uploadRes.text();
+    throw new Error(`Failed to upload PDF bytes to Gemini (${uploadRes.status}): ${errText}`);
+  }
+
+  const data = (await uploadRes.json()) as { file: GeminiUploadedFile };
+  return data.file;
+}
+
+async function deleteGeminiTempFile(env: RuntimeEnv, fileName: string): Promise<void> {
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/${fileName}`;
+    await fetch(url, {
+      method: "DELETE",
+      headers: { "x-goog-api-key": env.GEMINI_API_KEY },
+    });
+    console.log(JSON.stringify({ message: "gemini_temp_file_deleted", fileName }));
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        message: "gemini_temp_file_delete_warning",
+        fileName,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
 }
 
 const BOOK_DRAFT_SCHEMA: Record<string, unknown> = {
@@ -158,6 +248,55 @@ const BOOK_DRAFT_SCHEMA: Record<string, unknown> = {
     },
   },
 };
+
+function parseRawBookDraft(jsonText: string, defaultChangeSummary: string): GeneratedBookDraft {
+  const raw = JSON.parse(jsonText) as {
+    id: string;
+    title: string;
+    author: string;
+    categories: string[];
+    readTimeMinutes: number;
+    tagline: string;
+    overview: string;
+    keyTakeaways: string[];
+    chapters: Array<{ index: number; title: string; contentMarkdown: string }>;
+    changeSummary: string;
+  };
+
+  const normalizedChapters = raw.chapters.map((ch, idx) => ({
+    index: idx,
+    title: ch.title,
+    contentMarkdown: ch.contentMarkdown,
+  }));
+
+  const summary: BookSummary = {
+    id: raw.id,
+    title: raw.title,
+    author: raw.author,
+    categories: raw.categories,
+    readTimeMinutes: raw.readTimeMinutes,
+    overview: raw.overview,
+    keyTakeaways: raw.keyTakeaways,
+    chapters: normalizedChapters,
+  };
+
+  const catalogItem: BookCatalogItem = {
+    id: raw.id,
+    title: raw.title,
+    author: raw.author,
+    coverUrl: "",
+    categories: raw.categories,
+    readTimeMinutes: raw.readTimeMinutes,
+    chapterCount: normalizedChapters.length,
+    tagline: raw.tagline,
+  };
+
+  return {
+    summary,
+    catalogItem,
+    changeSummary: raw.changeSummary || defaultChangeSummary,
+  };
+}
 
 export async function classifyIntent(
   env: RuntimeEnv,
@@ -231,11 +370,7 @@ ${draftContext}`;
   return JSON.parse(jsonText) as ClassifiedIntent;
 }
 
-export async function generateBookSummaryDraft(
-  env: RuntimeEnv,
-  bookQuery: string,
-): Promise<GeneratedBookDraft> {
-  const systemInstruction = `You are an expert literary synthesizer creating a structured book summary for the Glance reading app.
+const SUMMARY_SYSTEM_PROMPT = `You are an expert literary synthesizer creating a structured book summary for the Glance reading app.
 Produce a deeply insightful, accurate, and engaging book summary following these rules:
 1. "id": kebab-case slug of the main book title (e.g., "the-lean-startup", "meditations").
 2. "overview": 2 to 4 crisp sentences capturing the book's central thesis.
@@ -246,54 +381,105 @@ Produce a deeply insightful, accurate, and engaging book summary following these
    - Bullet lists with "**bold**" lead-ins
    - Concrete examples and practical applications from the book.`;
 
+export async function generateBookSummaryDraft(
+  env: RuntimeEnv,
+  bookQuery: string,
+): Promise<GeneratedBookDraft> {
   const userPrompt = `Create a complete Glance book summary for: ${bookQuery}`;
-  const jsonText = await callGemini(env, systemInstruction, userPrompt, BOOK_DRAFT_SCHEMA);
-  const raw = JSON.parse(jsonText) as {
-    id: string;
-    title: string;
-    author: string;
-    categories: string[];
-    readTimeMinutes: number;
-    tagline: string;
-    overview: string;
-    keyTakeaways: string[];
-    chapters: Array<{ index: number; title: string; contentMarkdown: string }>;
-    changeSummary: string;
-  };
+  const jsonText = await callGemini(env, SUMMARY_SYSTEM_PROMPT, userPrompt, BOOK_DRAFT_SCHEMA);
+  return parseRawBookDraft(jsonText, `Created 5-chapter summary draft.`);
+}
 
-  const normalizedChapters = raw.chapters.map((ch, idx) => ({
-    index: idx,
-    title: ch.title,
-    contentMarkdown: ch.contentMarkdown,
-  }));
+export async function generateBookSummaryFromDocument(
+  env: RuntimeEnv,
+  options: {
+    fileName: string;
+    mimeType: string;
+    bytes: Uint8Array;
+    userCaption?: string;
+  },
+): Promise<GeneratedBookDraft> {
+  const { fileName, mimeType, bytes, userCaption } = options;
+  const lowerName = fileName.toLowerCase();
+  const extraInstruction = userCaption
+    ? `\nAdditional user instructions / focus: ${userCaption}`
+    : "";
 
-  const summary: BookSummary = {
-    id: raw.id,
-    title: raw.title,
-    author: raw.author,
-    categories: raw.categories,
-    readTimeMinutes: raw.readTimeMinutes,
-    overview: raw.overview,
-    keyTakeaways: raw.keyTakeaways,
-    chapters: normalizedChapters,
-  };
+  // Case 1: PDF file -> Upload temporarily to Gemini File API, generate summary, and DELETE immediately in `finally`
+  if (lowerName.endsWith(".pdf") || mimeType === "application/pdf") {
+    const uploaded = await uploadGeminiTempFile(env, bytes, "application/pdf", fileName);
+    try {
+      const prompt = `Create a complete, accurate 5-chapter Glance book summary grounded strictly in the attached PDF book ("${fileName}"). Extract the book's true title and author from the document.${extraInstruction}`;
+      const jsonText = await callGeminiParts(
+        env,
+        SUMMARY_SYSTEM_PROMPT,
+        [
+          {
+            fileData: {
+              mimeType: "application/pdf",
+              fileUri: uploaded.uri,
+            },
+          },
+          { text: prompt },
+        ],
+        BOOK_DRAFT_SCHEMA,
+      );
+      return parseRawBookDraft(
+        jsonText,
+        `Summarized from uploaded PDF "${fileName}" (temporary file purged).`,
+      );
+    } finally {
+      await deleteGeminiTempFile(env, uploaded.name);
+    }
+  }
 
-  const catalogItem: BookCatalogItem = {
-    id: raw.id,
-    title: raw.title,
-    author: raw.author,
-    coverUrl: "",
-    categories: raw.categories,
-    readTimeMinutes: raw.readTimeMinutes,
-    chapterCount: normalizedChapters.length,
-    tagline: raw.tagline,
-  };
+  // Case 2: EPUB file -> Unpack and extract chapters in Worker RAM (0 external files created)
+  if (lowerName.endsWith(".epub") || mimeType === "application/epub+zip") {
+    const extracted = extractTextFromEpub(bytes);
+    const metaHint = [
+      extracted.title ? `Detected Title: ${extracted.title}` : "",
+      extracted.author ? `Detected Author: ${extracted.author}` : "",
+    ]
+      .filter(Boolean)
+      .join(" | ");
 
-  return {
-    summary,
-    catalogItem,
-    changeSummary: raw.changeSummary || `Created 5-chapter summary draft for "${raw.title}".`,
-  };
+    const prompt = [
+      `Create a complete, accurate 5-chapter Glance book summary grounded strictly in the following book text extracted from "${fileName}".`,
+      metaHint ? `Metadata Hint: ${metaHint}` : "",
+      extraInstruction,
+      `\n--- BEGIN EXTRACTED BOOK TEXT ---\n${extracted.text}\n--- END EXTRACTED BOOK TEXT ---`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const jsonText = await callGemini(env, SUMMARY_SYSTEM_PROMPT, prompt, BOOK_DRAFT_SCHEMA);
+    return parseRawBookDraft(
+      jsonText,
+      `Summarized from uploaded EPUB "${fileName}" in ephemeral memory.`,
+    );
+  }
+
+  // Case 3: Plain Text / Markdown / HTML (.txt, .md, .html, .htm) -> Extract in Worker RAM
+  if (/\.(txt|md|markdown|html|htm|xhtml)$/i.test(lowerName) || mimeType.startsWith("text/")) {
+    const text = extractTextFromPlainOrHtml(bytes, fileName);
+    const prompt = [
+      `Create a complete, accurate 5-chapter Glance book summary grounded strictly in the following text from "${fileName}".`,
+      extraInstruction,
+      `\n--- BEGIN DOCUMENT TEXT ---\n${text}\n--- END DOCUMENT TEXT ---`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const jsonText = await callGemini(env, SUMMARY_SYSTEM_PROMPT, prompt, BOOK_DRAFT_SCHEMA);
+    return parseRawBookDraft(
+      jsonText,
+      `Summarized from uploaded document "${fileName}" in ephemeral memory.`,
+    );
+  }
+
+  throw new Error(
+    `Unsupported file format ("${fileName}"). Supported formats: .pdf, .epub, .txt, .md, .html`,
+  );
 }
 
 export async function reviseBookSummaryDraft(
@@ -317,51 +503,19 @@ User Revision Instruction:
 ${instruction}`;
 
   const jsonText = await callGemini(env, systemInstruction, userPrompt, BOOK_DRAFT_SCHEMA);
-  const raw = JSON.parse(jsonText) as {
-    id: string;
-    title: string;
-    author: string;
-    categories: string[];
-    readTimeMinutes: number;
-    tagline: string;
-    overview: string;
-    keyTakeaways: string[];
-    chapters: Array<{ index: number; title: string; contentMarkdown: string }>;
-    changeSummary: string;
-  };
-
-  const normalizedChapters = raw.chapters.map((ch, idx) => ({
-    index: idx,
-    title: ch.title,
-    contentMarkdown: ch.contentMarkdown,
-  }));
-
-  const summary: BookSummary = {
-    id: currentSummary.id,
-    title: raw.title,
-    author: raw.author,
-    coverUrl: currentCatalogItem.coverUrl,
-    categories: raw.categories,
-    readTimeMinutes: raw.readTimeMinutes,
-    overview: raw.overview,
-    keyTakeaways: raw.keyTakeaways,
-    chapters: normalizedChapters,
-  };
-
-  const catalogItem: BookCatalogItem = {
-    id: currentSummary.id,
-    title: raw.title,
-    author: raw.author,
-    coverUrl: currentCatalogItem.coverUrl,
-    categories: raw.categories,
-    readTimeMinutes: raw.readTimeMinutes,
-    chapterCount: normalizedChapters.length,
-    tagline: raw.tagline,
-  };
+  const parsed = parseRawBookDraft(jsonText, "Applied requested revisions to the draft.");
 
   return {
-    summary,
-    catalogItem,
-    changeSummary: raw.changeSummary || "Applied requested revisions to the draft.",
+    summary: {
+      ...parsed.summary,
+      id: currentSummary.id,
+      coverUrl: currentCatalogItem.coverUrl,
+    },
+    catalogItem: {
+      ...parsed.catalogItem,
+      id: currentSummary.id,
+      coverUrl: currentCatalogItem.coverUrl,
+    },
+    changeSummary: parsed.changeSummary,
   };
 }

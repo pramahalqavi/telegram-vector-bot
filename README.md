@@ -34,7 +34,8 @@ vector_bot/
     ├── security.ts         # Constant-time two-layer webhook authentication
     ├── telegram.ts         # Telegram Bot API client & Markdown->HTML converter
     ├── firebase.ts         # Web Crypto RS256 JWT signer & Firestore REST client
-    ├── gemini.ts           # Gemini structured output & natural language router
+    ├── gemini.ts           # Gemini structured output, PDF File API & natural language router
+    ├── ebook.ts            # In-memory EPUB (fflate), HTML, Markdown & TXT extractor
     └── modules/
         └── glance.ts       # Glance CMS module & KV staged draft state machine
 ```
@@ -44,11 +45,12 @@ vector_bot/
 
 ## 💬 Supported Commands & Natural Language
 
-| Action | Slash Command | Natural Language Example |
+| Action | Slash Command / Input | Natural Language / Usage Example |
 | :--- | :--- | :--- |
 | **List Catalog** | `/books` | *"List all Glance books"* |
 | **Inspect Book** | `/book atomic-habits` | *"Show me Atomic Habits chapters"* |
-| **Create Draft** | `/add The Lean Startup by Eric Ries` | *"Create a summary for The Lean Startup"* |
+| **Create Draft (Title)** | `/add The Lean Startup by Eric Ries` | *"Create a summary for The Lean Startup"* |
+| **Create Draft (File Upload)** | Upload `.pdf`, `.epub`, `.txt`, `.md`, `.html` (≤20 MB) | Attach file in Telegram (optional caption for focus instructions); processed in ephemeral memory with 0 bytes retained |
 | **Update Book** | *(natural language)* | *"Update atomic-habits: add a 6th chapter on environment design"* |
 | **Revise Active Draft** | *(reply while draft is active)* | *"Make chapter 3 more practical with examples"* |
 | **View Active Draft** | `/draft` | — |
