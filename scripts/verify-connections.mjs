@@ -41,6 +41,12 @@ async function verifyAll() {
   if (!tgMe.ok) throw new Error(`Telegram getMe failed: ${tgMe.description}`);
   console.log(`✅ Telegram Bot OK: @${tgMe.result.username} (${tgMe.result.first_name})`);
 
+  const whInfoRes = await fetch(
+    `https://api.telegram.org/bot${vars.TELEGRAM_BOT_TOKEN}/getWebhookInfo`,
+  );
+  const whInfo = await whInfoRes.json();
+  console.log(`📡 Telegram Webhook Info:`, JSON.stringify(whInfo.result, null, 2));
+
   // 2. Verify Gemini API
   let geminiOk = false;
   for (const model of ["gemini-3.8-flash", "gemini-3.5-flash-lite"]) {
