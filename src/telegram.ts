@@ -80,16 +80,54 @@ async function callTelegramApi<T = unknown>(
   return data.result ?? null;
 }
 
+function safeTruncateHtml(htmlText: string, maxLen: number): string {
+  if (htmlText.length <= maxLen) return htmlText;
+  // Cut at the last newline before maxLen - 35 to avoid slicing inside an HTML tag
+  const sliceTarget = maxLen - 35;
+  const lastNewline = htmlText.lastIndexOf("\n", sliceTarget);
+  const cutIdx = lastNewline > sliceTarget * 0.5 ? lastNewline : sliceTarget;
+  return `${htmlText.slice(0, cutIdx)}\n\n<i>…(truncated)</i>`;
+}
+
 export async function sendMessage(
   env: RuntimeEnv,
   chatId: number,
   htmlText: string,
   replyMarkup?: InlineKeyboardMarkup,
 ): Promise<{ message_id: number } | null> {
-  const trimmed =
-    htmlText.length > TELEGRAM_MAX_LENGTH
-      ? `${htmlText.slice(0, TELEGRAM_MAX_LENGTH - 30)}\n\n<i>…(truncated)</i>`
-      : htmlText;
+  // If there's no inline keyboard and the message exceeds TELEGRAM_MAX_LENGTH, split by newline chunks
+  if (!replyMarkup && htmlText.length > TELEGRAM_MAX_LENGTH) {
+    const lines = htmlText.split("\n");
+    let currentChunk = "";
+    let lastResult: { message_id: number } | null = null;
+
+    for (const line of lines) {
+      const candidate = currentChunk ? `${currentChunk}\n${line}` : line;
+      if (candidate.length > TELEGRAM_MAX_LENGTH && currentChunk) {
+        lastResult = await callTelegramApi<{ message_id: number }>(env, "sendMessage", {
+          chat_id: chatId,
+          text: currentChunk,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+        });
+        currentChunk = line;
+      } else {
+        currentChunk = candidate;
+      }
+    }
+
+    if (currentChunk) {
+      lastResult = await callTelegramApi<{ message_id: number }>(env, "sendMessage", {
+        chat_id: chatId,
+        text: safeTruncateHtml(currentChunk, TELEGRAM_MAX_LENGTH),
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    }
+    return lastResult;
+  }
+
+  const trimmed = safeTruncateHtml(htmlText, TELEGRAM_MAX_LENGTH);
 
   return callTelegramApi<{ message_id: number }>(env, "sendMessage", {
     chat_id: chatId,
@@ -107,10 +145,7 @@ export async function editMessageText(
   htmlText: string,
   replyMarkup?: InlineKeyboardMarkup,
 ): Promise<void> {
-  const trimmed =
-    htmlText.length > TELEGRAM_MAX_LENGTH
-      ? `${htmlText.slice(0, TELEGRAM_MAX_LENGTH - 30)}\n\n<i>…(truncated)</i>`
-      : htmlText;
+  const trimmed = safeTruncateHtml(htmlText, TELEGRAM_MAX_LENGTH);
 
   await callTelegramApi(env, "editMessageText", {
     chat_id: chatId,

@@ -14,6 +14,7 @@ import {
   sendMessage,
 } from "../telegram";
 import type {
+  BookCatalogDoc,
   BookCatalogItem,
   BookSummary,
   InlineKeyboardButton,
@@ -192,34 +193,138 @@ function buildPublishedBookKeyboard(bookId: string, chapterCount: number): Inlin
   return { inline_keyboard: rows };
 }
 
-// --- Command & Intent Actions ---
+// --- Paginated & Searchable Catalog View ---
 
-async function handleListBooks(env: RuntimeEnv, chatId: number): Promise<void> {
-  const catalog = await getCatalog(env);
-  if (catalog.books.length === 0) {
-    await sendMessage(
-      env,
-      chatId,
-      `📚 <b>Glance Catalog is empty.</b>\n\nUse <code>/add &lt;Book Title&gt;</code> or ask me in natural language to create your first book summary!`,
-    );
-    return;
+const BOOKS_PER_PAGE = 10;
+
+function parseBooksCommandArgs(rawArg: string): { page: number; filterQuery: string } {
+  const trimmed = rawArg.trim();
+  if (!trimmed) return { page: 1, filterQuery: "" };
+
+  // Match "/books 2" or "/books page 2"
+  const pageOnlyMatch = trimmed.match(/^(?:page\s+)?(\d+)$/i);
+  if (pageOnlyMatch) {
+    return { page: Math.max(1, Number(pageOnlyMatch[1])), filterQuery: "" };
   }
 
-  const lines = catalog.books.map(
+  // Match "/books psychology 2"
+  const trailingPageMatch = trimmed.match(/^(.*?)\s+(?:page\s+)?(\d+)$/i);
+  if (trailingPageMatch && trailingPageMatch[1].trim().length > 0) {
+    return {
+      filterQuery: trailingPageMatch[1].trim(),
+      page: Math.max(1, Number(trailingPageMatch[2])),
+    };
+  }
+
+  return { page: 1, filterQuery: trimmed };
+}
+
+function buildCatalogPageView(
+  catalog: BookCatalogDoc,
+  requestedPage = 1,
+  rawFilterQuery = "",
+): { html: string; keyboard?: InlineKeyboardMarkup } {
+  const filterQuery = rawFilterQuery.trim();
+  const normalizedFilter = filterQuery.toLowerCase();
+
+  const matchingBooks = normalizedFilter
+    ? catalog.books.filter(
+        (b) =>
+          b.title.toLowerCase().includes(normalizedFilter) ||
+          b.author.toLowerCase().includes(normalizedFilter) ||
+          b.id.toLowerCase().includes(normalizedFilter) ||
+          (b.tagline && b.tagline.toLowerCase().includes(normalizedFilter)) ||
+          (b.categories ?? []).some((c) => c.toLowerCase().includes(normalizedFilter)),
+      )
+    : catalog.books;
+
+  if (matchingBooks.length === 0) {
+    const html = filterQuery
+      ? `🔍 <b>No books matched</b> "<code>${escapeHtml(filterQuery)}</code>" (out of ${catalog.books.length} books in Glance).\n\nTap below to view all books or try a different keyword.`
+      : `📚 <b>Glance Catalog is empty.</b>\n\nUse <code>/add &lt;Book Title&gt;</code> or upload a <b>.pdf</b> / <b>.epub</b> to create your first book summary!`;
+
+    const keyboard: InlineKeyboardMarkup | undefined = filterQuery
+      ? {
+          inline_keyboard: [[{ text: "📚 Show All Books", callback_data: "glance:books:1:" }]],
+        }
+      : undefined;
+
+    return { html, keyboard };
+  }
+
+  const totalPages = Math.max(1, Math.ceil(matchingBooks.length / BOOKS_PER_PAGE));
+  const currentPage = Math.min(Math.max(1, requestedPage), totalPages);
+  const startIdx = (currentPage - 1) * BOOKS_PER_PAGE;
+  const pageBooks = matchingBooks.slice(startIdx, startIdx + BOOKS_PER_PAGE);
+
+  const lines = pageBooks.map(
     (b, idx) =>
-      `${idx + 1}. <b>${escapeHtml(b.title)}</b> — <i>${escapeHtml(b.author)}</i>\n    🆔 <code>${escapeHtml(b.id)}</code> • ${b.chapterCount} ch • ${b.readTimeMinutes}m • 🏷️ ${escapeHtml(b.categories.join(", "))}`,
+      `${startIdx + idx + 1}. <b>${escapeHtml(b.title)}</b> — <i>${escapeHtml(b.author)}</i>\n    🆔 <code>${escapeHtml(b.id)}</code> • ${b.chapterCount} ch • ${b.readTimeMinutes}m • 🏷️ ${escapeHtml((b.categories ?? []).join(", "))}`,
   );
 
+  const headerTitle = filterQuery
+    ? `🔍 <b>Glance Books matching "${escapeHtml(filterQuery)}" (${matchingBooks.length} of ${catalog.books.length})</b>`
+    : `📚 <b>Glance Book Catalog (${catalog.books.length} books)</b>`;
+
+  const pageSubtitle =
+    totalPages > 1
+      ? `📄 <b>Page ${currentPage} of ${totalPages}</b> <i>(Showing ${startIdx + 1}–${startIdx + pageBooks.length})</i>`
+      : `<i>Showing all ${matchingBooks.length} book(s)</i>`;
+
   const html = [
-    `📚 <b>Glance Book Catalog (${catalog.books.length})</b>`,
-    `<i>Updated: ${escapeHtml(catalog.updatedAt)}</i>`,
+    headerTitle,
+    pageSubtitle,
     ``,
     ...lines,
     ``,
-    `💡 <i>Inspect a book with</i> <code>/book &lt;id&gt;</code> <i>or ask in natural language.</i>`,
+    `💡 <i>Inspect:</i> <code>/book &lt;id&gt;</code> • <i>Search:</i> <code>/books &lt;keyword&gt;</code> • <i>Jump:</i> <code>/books &lt;page&gt;</code>`,
   ].join("\n");
 
-  await sendMessage(env, chatId, html);
+  const safeFilterCallback = filterQuery.slice(0, 32).replace(/:/g, " ");
+  const rows: InlineKeyboardButton[][] = [];
+
+  if (totalPages > 1) {
+    const navRow: InlineKeyboardButton[] = [];
+    if (currentPage > 1) {
+      navRow.push({
+        text: "⬅️ Prev",
+        callback_data: `glance:books:${currentPage - 1}:${safeFilterCallback}`,
+      });
+    }
+    navRow.push({
+      text: `📄 ${currentPage} / ${totalPages}`,
+      callback_data: `glance:noop:${currentPage}`,
+    });
+    if (currentPage < totalPages) {
+      navRow.push({
+        text: "Next ➡️",
+        callback_data: `glance:books:${currentPage + 1}:${safeFilterCallback}`,
+      });
+    }
+    rows.push(navRow);
+  }
+
+  if (filterQuery) {
+    rows.push([{ text: "📚 Show All Books", callback_data: "glance:books:1:" }]);
+  }
+
+  return {
+    html,
+    keyboard: rows.length > 0 ? { inline_keyboard: rows } : undefined,
+  };
+}
+
+// --- Command & Intent Actions ---
+
+async function handleListBooks(
+  env: RuntimeEnv,
+  chatId: number,
+  page = 1,
+  filterQuery = "",
+): Promise<void> {
+  const catalog = await getCatalog(env);
+  const view = buildCatalogPageView(catalog, page, filterQuery);
+  await sendMessage(env, chatId, view.html, view.keyboard);
 }
 
 async function handleInspectBook(
@@ -446,7 +551,9 @@ function getHelpHtml(): string {
     `🤖 <b>VectorBot — Personal AI Assistant & Glance CMS</b>`,
     ``,
     `<b>Glance Book Summary Commands:</b>`,
-    `• <code>/books</code> — List all books in Glance`,
+    `• <code>/books</code> — Browse books in Glance (10 per page with buttons)`,
+    `• <code>/books &lt;page&gt;</code> — Jump to a specific page (e.g. <code>/books 2</code>)`,
+    `• <code>/books &lt;keyword&gt;</code> — Search books by title, author, or category (e.g. <code>/books finance</code>)`,
     `• <code>/book &lt;id&gt;</code> — Inspect a book's overview, takeaways & chapters`,
     `• <code>/add &lt;Title by Author&gt;</code> — Draft a new 5-chapter book summary`,
     `• <code>/delete &lt;id&gt;</code> — Stage a book deletion (with confirmation)`,
@@ -458,7 +565,8 @@ function getHelpHtml(): string {
     `• Processed in ephemeral memory — 0 bytes are kept on Cloudflare or Gemini after drafting!`,
     ``,
     `<b>Natural Language & Review Flow:</b>`,
-    `• Ask naturally: <i>"Create a summary for The Lean Startup by Eric Ries"</i>`,
+    `• Browse & search naturally: <i>"Show me page 2 of my books"</i> or <i>"List my psychology books"</i>`,
+    `• Create naturally: <i>"Create a summary for The Lean Startup by Eric Ries"</i>`,
     `• Update existing: <i>"Update atomic-habits: add a 6th chapter on environment design"</i>`,
     `• Revise active draft: While a draft is pending, just reply with changes (e.g. <i>"Make chapter 3 more practical with examples"</i>) before tapping <b>✅ Confirm & Push</b>.`,
   ].join("\n");
@@ -576,8 +684,17 @@ export async function handleTelegramMessage(
       return;
     }
 
-    if (text === "/books" || text.startsWith("/books@")) {
-      await handleListBooks(env, chatId);
+    if (
+      text === "/books" ||
+      text.startsWith("/books@") ||
+      text.startsWith("/books ") ||
+      text.startsWith("/search ")
+    ) {
+      const rawArg = text.startsWith("/search ")
+        ? text.slice("/search ".length)
+        : text.replace(/^\/books(?:@\S+)?\s*/i, "");
+      const { page, filterQuery } = parseBooksCommandArgs(rawArg);
+      await handleListBooks(env, chatId, page, filterQuery);
       return;
     }
 
@@ -642,7 +759,12 @@ export async function handleTelegramMessage(
 
     switch (classified.intent) {
       case "list_books":
-        await handleListBooks(env, chatId);
+        await handleListBooks(
+          env,
+          chatId,
+          classified.page && classified.page > 0 ? classified.page : 1,
+          classified.filterQuery || "",
+        );
         break;
 
       case "inspect_book":
@@ -744,6 +866,26 @@ export async function handleTelegramCallback(
   }
 
   try {
+    // 0. Paginated Catalog Navigation (glance:books:<page>:<filter>)
+    if (data.startsWith("glance:books:")) {
+      const rest = data.slice("glance:books:".length);
+      const colonIdx = rest.indexOf(":");
+      const targetPage =
+        colonIdx === -1 ? Number(rest) || 1 : Number(rest.slice(0, colonIdx)) || 1;
+      const filterQuery = colonIdx === -1 ? "" : rest.slice(colonIdx + 1);
+
+      const catalog = await getCatalog(env);
+      const view = buildCatalogPageView(catalog, targetPage, filterQuery);
+      await answerCallbackQuery(env, callback.id, `Page ${targetPage}`);
+      await editMessageText(env, chatId, messageId, view.html, view.keyboard);
+      return;
+    }
+
+    if (data.startsWith("glance:noop")) {
+      await answerCallbackQuery(env, callback.id);
+      return;
+    }
+
     // 1. Confirm Staged Draft -> Commit to Firestore
     if (data === "glance:confirm") {
       const draft = await getActiveDraft(env, userId);

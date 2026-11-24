@@ -16,6 +16,8 @@ export interface ClassifiedIntent {
   bookId?: string;
   bookQuery?: string;
   instruction?: string;
+  page?: number;
+  filterQuery?: string;
   reply?: string;
 }
 
@@ -306,7 +308,12 @@ export async function classifyIntent(
 ): Promise<ClassifiedIntent> {
   const catalogContext =
     availableBooks.length > 0
-      ? availableBooks.map((b) => `- ${b.id}: "${b.title}" by ${b.author}`).join("\n")
+      ? availableBooks
+          .map(
+            (b) =>
+              `- ${b.id}: "${b.title}" by ${b.author} [${(b.categories ?? []).join(", ")}]`,
+          )
+          .join("\n")
       : "(Catalog is currently empty)";
 
   const draftContext = activeDraft
@@ -315,8 +322,10 @@ export async function classifyIntent(
 
   const systemInstruction = `You are VectorBot, a private personal AI assistant on Telegram with a Glance Book Summary CMS module.
 Classify the user's message into one of these intents:
-- "list_books": User wants to see all books in Glance catalog.
-- "inspect_book": User wants to view details, takeaways, or chapters of an existing book in the catalog.
+- "list_books": User wants to see/browse/search books in the Glance catalog (all books, a specific page like "page 2", or filtered by a topic/category/author/keyword like "list psychology books" or "books by Cal Newport").
+  - If the user asks for a specific page number (e.g. "page 2 of books"), set "page" to that 1-based integer.
+  - If the user asks to filter or search the catalog by keyword, category, or author (e.g. "show finance books", "search habits"), set "filterQuery" to the concise keyword (e.g. "finance", "habits"). Leave "filterQuery" empty if the user wants all books.
+- "inspect_book": User wants to view details, takeaways, or chapters of a single specific book in the catalog.
 - "create_book": User wants to create/add a new book summary for Glance.
 - "update_book": User wants to edit/modify an existing book in the Glance catalog (and not the active draft).
 - "revise_draft": An active draft exists and the user is giving feedback/edits to modify that active draft.
@@ -358,6 +367,15 @@ ${draftContext}`;
       instruction: {
         type: "STRING",
         description: "Specific update or revision instructions from the user",
+      },
+      page: {
+        type: "INTEGER",
+        description: "1-based page number when intent is list_books (default 1)",
+      },
+      filterQuery: {
+        type: "STRING",
+        description:
+          "Optional keyword/category/author filter when intent is list_books (leave empty for all books)",
       },
       reply: {
         type: "STRING",

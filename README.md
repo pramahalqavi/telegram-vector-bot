@@ -47,7 +47,8 @@ vector_bot/
 
 | Action | Slash Command / Input | Natural Language / Usage Example |
 | :--- | :--- | :--- |
-| **List Catalog** | `/books` | *"List all Glance books"* |
+| **List Catalog (Paginated)** | `/books` or `/books 2` | *"List all Glance books"* or *"Show page 2 of my books"* (10 per page with `⬅️ Prev` / `Next ➡️` buttons) |
+| **Search / Filter Catalog** | `/books finance` or `/search habits` | *"List all my psychology books"* or *"Books by Cal Newport"* |
 | **Inspect Book** | `/book atomic-habits` | *"Show me Atomic Habits chapters"* |
 | **Create Draft (Title)** | `/add The Lean Startup by Eric Ries` | *"Create a summary for The Lean Startup"* |
 | **Create Draft (File Upload)** | Upload `.pdf`, `.epub`, `.txt`, `.md`, `.html` (≤20 MB) | Attach file in Telegram (optional caption for focus instructions); processed in ephemeral memory with 0 bytes retained |
